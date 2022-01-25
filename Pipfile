@@ -5,6 +5,8 @@ name = "pypi"
 
 [packages]
 "discord.py" = "*"
+python-dotenv = "*"
+emoji = "*"
 
 [dev-packages]
 
