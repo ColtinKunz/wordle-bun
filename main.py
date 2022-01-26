@@ -330,3 +330,5 @@ client = BunClient(intents=intents)
 client.run(TOKEN)
 
 print("yellow")
+
+print("blue")
