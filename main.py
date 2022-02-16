@@ -4,9 +4,9 @@ import sqlite3
 from os import getenv
 from emoji import demojize
 from dotenv import load_dotenv
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-from aux_lib import get_prefix, count_avg_stats
+from aux_lib import get_prefix, count_avg_stats, get_wordle_result, avg_message
 
 intents = discord.Intents.default()
 intents.members = True
@@ -20,20 +20,6 @@ INIT_MSG = getenv("INIT_MESSAGE")
 RESET_MSG = getenv("RESET_MESSAGE")
 
 
-class WordleResult:
-    def __init__(
-        self,
-        game_num: int,
-        num_guesses: int,
-        square_lines: List[List[str]],
-        is_hard_mode: bool,
-    ):
-        self.game_num = game_num
-        self.num_guesses = num_guesses
-        self.square_lines = square_lines
-        self.is_hard_mode = is_hard_mode
-
-
 class BunClient(discord.Client):
     def __init__(self, *args, **kwargs) -> None:
         self.channels: Dict[int, int] = {}
@@ -42,6 +28,7 @@ class BunClient(discord.Client):
     async def on_ready(self) -> None:
         print(f"{client.user} has connected to Discord!")
         self.conn = sqlite3.connect("wordle.db")
+        self.curs = self.conn.cursor()
         print("Connected to database!")
 
     async def on_message(self, message) -> None:
@@ -52,7 +39,7 @@ class BunClient(discord.Client):
 
         # Init command
         if message.content == PREFIX + "init":
-            self.initialize_bot(guild_id, channel_id)
+            self.set_channel(guild_id, channel_id)
             await client.get_channel(channel_id).send(INIT_MSG)
             return
 
@@ -84,42 +71,25 @@ class BunClient(discord.Client):
             await channel.send(RESET_MSG)
 
         elif command == "mystats":
-            average_stats = self.get_average_stats(user_id, guild_id)
+            average_stats = self.get_average_stats(1)
+            print(average_stats)
 
-            if average_stats is None or average_stats["all"]["rounds"] == 0:
+            if average_stats is None or average_stats["total"]["rounds"] == 0:
                 await channel.send("You have no results uploaded yet.")
             else:
                 average_message = (
-                    f'{average_stats["all"]["average_guesses"]}'
-                    + f' - {average_stats["all"]["rounds"]} rounds'
-                    + f' | Fails: {average_stats["all"]["fails"]}\n'
+                    avg_message(average_stats, "total")
+                    + avg_message(average_stats, "easy")
+                    + avg_message(average_stats, "hard")
                 )
-
-                try:
-                    average_message += (
-                        f'{average_stats["hard"]["average_guesses"]}'
-                        + f' - {average_stats["hard"]["rounds"]} hard rounds'
-                        + f' | Fails: {average_stats["hard"]["fails"]}\n'
-                    )
-                except KeyError:
-                    pass
-
-                try:
-                    average_message += (
-                        f'{average_stats["easy"]["average_guesses"]}'
-                        + f' - {average_stats["easy"]["rounds"]} easy rounds'
-                        + f' | Fails: {average_stats["easy"]["fails"]}\n'
-                    )
-                except KeyError:
-                    pass
 
                 await channel.send(average_message)
 
         elif command == "leaderboard":
-            user_servers = self.conn.execute(
+            user_servers = self.curs.execute(
                 f"""
                 SELECT DISTINCT user_id, server_id
-                FROM WordleResult
+                FROM WordleResults
                 WHERE server_id = "{guild_id}"
                 """
             ).fetchall()
@@ -145,9 +115,7 @@ class BunClient(discord.Client):
                 return f"{user.display_name}: {average} - {total} rounds | Fails: {fails}\n"
 
             for user_server in user_servers:
-                average_stats = self.get_average_stats(
-                    user_server[0], user_server[1]
-                )
+                average_stats = self.get_average_stats(user_server[0])
 
                 try:
                     ordered_stats.append(
@@ -169,174 +137,118 @@ class BunClient(discord.Client):
 
             await channel.send(leaderboard_message)
 
-        elif command == "channels":
-            print(self.channels.items())
-
         elif command == "kill":
             await client.close()
 
-        elif command == "stats":
-            print(self.get_stats(user_id, guild_id))
-
-    def initialize_bot(self, guild_id: int, channel_id: int) -> None:
+    def set_channel(self, guild_id: int, channel_id: int) -> None:
         self.channels[guild_id] = channel_id
 
-        try:
-            self.delete_db()
-
-        except sqlite3.OperationalError:
-            pass
+        self.delete_db()
 
         self.initialize_db()
 
     def initialize_db(self) -> None:
-        self.conn.execute(
+        self.curs.execute(
             """
-            CREATE TABLE WordleResult(
-                id              INTEGER PRIMARY KEY AUTOINCREMENT UNIQUE        NOT NULL,
-                user_id         CHAR(17)                                        NOT NULL,
-                server_id       CHAR(17)                                        NOT NULL,
-                game_num        INT                                             NOT NULL,
-                num_guesses     INT                                             NOT NULL,
-                hard_mode       INT                                             NOT NULL
+            CREATE TABLE WordleResults(
+                user_id         BIGINT      NOT NULL,
+                game_num        INT         NOT NULL,
+                guild_id        BIGINT      NOT NULL,
+                num_guesses     INT         NOT NULL,
+                hard_mode       BOOL        NOT NULL,
+                PRIMARY KEY (user_id, game_num)
             );
             """
         )
 
-        self.conn.execute(
+        self.curs.execute(
             """
-            CREATE UNIQUE INDEX unique_cons
-            ON WordleResult(
-                user_id, server_id, game_num
+            CREATE TABLE UserStats(
+                user_id         BIGINT PRIMARY KEY      NOT NULL,
+                total_rounds    INT                     NOT NULL,
+                total_guesses   INT                     NOT NULL,
+                total_fails     INT                     NOT NULL,
+                easy_rounds     INT                     NOT NULL,
+                easy_guesses    INT                     NOT NULL,
+                easy_fails      INT                     NOT NULL,
+                hard_rounds     INT                     NOT NULL,
+                hard_guesses    INT                     NOT NULL,
+                hard_fails      INT                     NOT NULL
             );
+            """
+        )
+
+        self.curs.execute(
+            """
+            INSERT INTO UserStats VALUES (1, 9, 8, 7, 6, 5, 4, 3, 2, 1);
             """
         )
 
         self.conn.commit()
 
     def delete_db(self) -> None:
-        self.conn.execute(
+        self.curs.execute(
             """
-            DROP TABLE WordleResult;
+            DROP TABLE WordleResults;
+            """
+        )
+
+        self.curs.execute(
+            """
+            DROP TABLE UserStats;
             """
         )
 
         self.conn.commit()
-
-    def get_wordle_result(self, msg_text: str) -> Optional[WordleResult]:
-        # Wordle, number of wordle game, results, squares
-        split_msg = msg_text.split()
-
-        if len(split_msg) < 3 or split_msg[0] != "Wordle":
-            return None
-
-        game_num = int(split_msg[1])
-        result = split_msg[2]
-
-        num_guesses = 0 if result[0] == "X" else int(result[0])
-        is_hard_mode = len(result) == 4 and result[3] == "*"
-
-        square_lines = []
-        for square_line in split_msg[:]:
-            squares = demojize(square_line).split(":")
-
-            squares = [i for i in squares if i != ""]
-
-            line = []
-            for square in squares:
-                if square == "green_square" or square == "orange_square":
-                    line.append("good")
-                elif square == "yellow_square" or square == "blue_square":
-                    line.append("close")
-                else:
-                    line.append("no")
-
-            square_lines.append(line)
-
-        return WordleResult(game_num, num_guesses, square_lines, is_hard_mode)
 
     def insert_wordle_result(
         self, msg_text: str, user_id: int, guild_id: int
     ) -> None:
 
-        result = self.get_wordle_result(msg_text)
+        result = get_wordle_result(msg_text)
 
         if result is None:
             return
 
-        self.conn.execute(
-            f"""
-            REPLACE INTO WordleResult (
+        self.curs.execute(
+            """
+            REPLACE INTO WordleResults (
                 user_id,
-                server_id,
                 game_num,
+                guild_id,
                 num_guesses,
                 hard_mode
             ) \
             VALUES (
-                {user_id},
-                {guild_id},
-                {result.game_num},
-                {result.num_guesses if result.num_guesses is not None else "NULL"},
-                {result.is_hard_mode}
+                ?,
+                ?,
+                ?,
+                ?,
+                ?
             )
         """
         )
         self.conn.commit()
 
-    def get_stats(self, user_id: int, guild_id: int) -> List[Tuple[int, int]]:
-        return self.conn.execute(
+    def get_stats(self, user_id: int, mode: str) -> Tuple[int, int, int]:
+        return self.curs.execute(
             f"""
-            SELECT num_guesses, hard_mode
-            FROM WordleResult
-            WHERE user_id = "{user_id}" AND server_id = "{guild_id}"
+            SELECT {mode}_rounds, {mode}_guesses, {mode}_fails
+            FROM UserStats
+            WHERE user_id = {user_id}
             """
-        ).fetchall()
+        ).fetchone()
 
-    def get_average_stats(self, user_id: int, guild_id: int):
-        total_rounds = 0
-        total_guesses = 0
-        total_fails = 0
+    def get_average_stats(self, user_id: int) -> Dict[str, Dict[str, str]]:
+        total = self.get_stats(user_id, "total")
+        print(type(total))
 
-        easy_rounds = 0
-        easy_guesses = 0
-        easy_fails = 0
+        easy = self.get_stats(user_id, "easy")
 
-        hard_rounds = 0
-        hard_guesses = 0
-        hard_fails = 0
-
-        results = self.get_stats(user_id, guild_id)
-
-        if len(results) == 0:
-            return None
-
-        for result in results:
-            guesses = result[0]
-            is_hard_mode = result[1] == 1
-            total_rounds += 1
-
-            if guesses > 0:
-                total_guesses += guesses
-                if is_hard_mode:
-                    hard_guesses += guesses
-                    hard_rounds += 1
-                else:
-                    easy_guesses += guesses
-                    easy_rounds += 1
-            else:
-                total_fails += 1
-                if result[1] == 1:
-                    hard_fails += 1
-                else:
-                    easy_fails += 1
-
-        total = (total_rounds, total_guesses, total_fails)
-        easy = (easy_rounds, easy_guesses, easy_fails)
-        hard = (hard_rounds, hard_guesses, hard_fails)
+        hard = self.get_stats(user_id, "hard")
 
         average_dict = {
-            "all": count_avg_stats(*total),
+            "total": count_avg_stats(*total),
             "easy": count_avg_stats(*easy),
             "hard": count_avg_stats(*hard),
         }
